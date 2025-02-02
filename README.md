@@ -1,0 +1,1 @@
+RAG based Assistant - Agent AI using Langgraph. Able to answer queries from internal PDF's based on context retrieval and also from general web search. ReAct agent will route and choose appropriate function call.
