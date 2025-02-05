@@ -1,4 +1,5 @@
-from typing import Literal
+from typing import TypedDict, Annotated
+import operator
 from langchain_core.messages import HumanMessage, AnyMessage, SystemMessage, ToolMessage
 from langchain_openai.chat_models import ChatOpenAI
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -13,6 +14,10 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 from dotenv import load_dotenv
 
 load_dotenv("./.env")
+
+# defining agent state
+class AgentState(TypedDict):
+   messages: Annotated[list[AnyMessage], operator.add]
 
 
 @tool
@@ -42,37 +47,56 @@ def web_search(query: str):
     answer=tool.invoke(query)
     return answer
 
-tools = [retrieve_context, web_search]
-tool_node = ToolNode(tools)
-
-llm=ChatOpenAI(model="gpt-4o-mini-2024-07-18").bind_tools(tools)    
+toolset = [retrieve_context, web_search] 
 
 
-# Function that invokes the model
-def call_model(state: MessagesState):
-    messages = state['messages']
-    response = llm.invoke(messages)
-    return {"messages": [response]}  # Returns as a list to add to the state
+class AssistantAgent:
+    # initialising the object
+    def __init__(self, model, tools, system_prompt = ""):
+        self.system_prompt = system_prompt
+        # initialising graph with a state 
+        builder = StateGraph(AgentState)
+        tool_node = ToolNode(tools)
 
-def should_continue(state:MessagesState):
-    messages=state['messages']
-    last_message=messages[-1] 
-    if last_message.tool_calls:
-        return "tools"
-    return END
+        builder.add_node("llm_node",self.call_llm)
+        builder.add_node("tools",tool_node)
+
+        builder.add_edge(START,"llm_node")
+        builder.add_conditional_edges("llm_node",self.should_continue)
+        builder.add_edge("tools","llm_node")
+
+        memory = MemorySaver()
+
+        self.graph = builder.compile(checkpointer=memory)
+        #self.tools = {t.name: t for t in tools}
+        self.model = model.bind_tools(tools)
+
+    def call_llm(self, state: AgentState):# Function that invokes the model
+        messages = state['messages']
+        # adding system prompt if it's defined
+        if self.system_prompt:
+            messages = [SystemMessage(content=self.system_prompt)] + messages
+        
+        # calling LLM
+        message = self.model.invoke(messages)
+        return {'messages': [message]}
+    
+    def should_continue(self, state: AgentState):# Function that checks tool call return from llm
+        messages=state['messages']
+        last_message=messages[-1] 
+        if last_message.tool_calls:
+            return "tools"
+        return END
+    
+
+# system prompt
+prompt = '''You are a very helpful chatbot assistant for the Toyo Tanso Ltd.**, a multinational conglomerate involved in high-level research and manufacturing of carbon products with a goal of helping the employee with his questions. 
+Your primary function is to help employees quickly by answering thier questions using precise, context-aware information from the companys knowledge base, which have documents related to compliance guidelines, project best practices, client onboarding materials and industry research reports.
+The employee may also ask general question which needs to be answered using web search and should not reflect any data or answers from internal company policy documents '''
 
 
-builder = StateGraph(MessagesState)
-
-builder.add_node("llm_node",call_model)
-builder.add_node("tools",tool_node)
-
-builder.add_edge(START,"llm_node")
-builder.add_conditional_edges("llm_node",should_continue)
-builder.add_edge("tools","llm_node")
-
-memory = MemorySaver()
-react_graph=builder.compile(checkpointer=memory)
+llm=ChatOpenAI(model="gpt-4o-mini-2024-07-18")     
+chat_agent = AssistantAgent(llm, toolset, prompt)  
 
 more_questions = True
 while(more_questions):
@@ -82,8 +106,8 @@ while(more_questions):
     question = input("Ask your question : ")
     if question == "":
         more_questions=False
+    messages = [HumanMessage(content=question)]
 
-    response = react_graph.invoke({"messages": [HumanMessage(content=question)]},config)
-
-    for m in response["messages"]:
-        m.pretty_print()
+    for event in chat_agent.graph.stream({"messages": messages}, config):
+        for v in event.values():
+            v['messages'][-1].pretty_print()
